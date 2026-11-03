@@ -73,6 +73,14 @@ if (hit.fits) {
 
 MIT. The data is free to reuse with attribution to this repository.
 
+## Citation
+
+If you use the benchmark data, cite the archived dataset:
+
+> mingyuetutu0527 (2026). *Browser JPEG/WebP target-size benchmarks (108 headless-Chrome runs)*. Zenodo. https://doi.org/10.5281/zenodo.23916007
+
+DOI: [10.5281/zenodo.23916007](https://doi.org/10.5281/zenodo.23916007)
+
 ---
 
 The same target-size search runs in [ExactSize](https://crunchimage.com), a browser-only image compressor that never uploads your files.
