@@ -1,0 +1,162 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>bench</title></head>
+<body><pre id="log">idle</pre>
+<script>
+/* Deterministic canvas benchmark: how many bytes does the browser's own
+ * JPEG/WebP encoder give you for a given target size, and what quality /
+ * downscale does it take to get there?
+ * No randomness that isn't seeded. Same input -> same output. */
+
+function lcg(seed) {
+  let s = seed >>> 0;
+  return function () {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+}
+
+function makeSource(pattern, w, h) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const x = c.getContext('2d');
+  const rnd = lcg(w * 7 + h * 13 + pattern.length);
+
+  if (pattern === 'photo') {
+    const g = x.createLinearGradient(0, 0, w, h);
+    g.addColorStop(0, '#1b3a5c'); g.addColorStop(0.5, '#c98b4b'); g.addColorStop(1, '#f2e4c9');
+    x.fillStyle = g; x.fillRect(0, 0, w, h);
+    for (let i = 0; i < 60; i++) {
+      x.beginPath();
+      x.arc(rnd() * w, rnd() * h, (0.03 + rnd() * 0.12) * Math.min(w, h), 0, Math.PI * 2);
+      x.fillStyle = 'rgba(' + Math.floor(rnd() * 255) + ',' + Math.floor(rnd() * 255) + ',' + Math.floor(rnd() * 255) + ',0.18)';
+      x.fill();
+    }
+    // grain: this is what makes photographs expensive to encode
+    const img = x.getImageData(0, 0, w, h), d = img.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const n = (rnd() - 0.5) * 26;
+      d[i] += n; d[i + 1] += n; d[i + 2] += n;
+    }
+    x.putImageData(img, 0, 0);
+  } else if (pattern === 'screenshot') {
+    x.fillStyle = '#ffffff'; x.fillRect(0, 0, w, h);
+    x.fillStyle = '#111111';
+    const lh = Math.max(8, Math.round(h / 60));
+    for (let y = lh; y < h - lh; y += lh * 1.6) {
+      let cx = Math.round(w * 0.05);
+      while (cx < w * 0.92) {
+        const wordW = Math.round((0.02 + rnd() * 0.06) * w);
+        x.fillRect(cx, y, wordW, lh);
+        cx += wordW + Math.round(lh * 0.6);
+      }
+    }
+    const cols = ['#d94f3d', '#2f7fd1', '#37a05a', '#e0a92b'];
+    for (let i = 0; i < 8; i++) {
+      x.fillStyle = cols[i % cols.length];
+      x.fillRect(Math.round(rnd() * w * 0.8), Math.round(rnd() * h * 0.8), Math.round(w * 0.12), Math.round(h * 0.06));
+    }
+  } else { // flat
+    x.fillStyle = '#eef2f7'; x.fillRect(0, 0, w, h);
+    const g = x.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, '#eef2f7'); g.addColorStop(1, '#dfe6ef');
+    x.fillStyle = g; x.fillRect(0, 0, w, h);
+  }
+  return c;
+}
+
+function encode(canvas, mime, quality) {
+  return new Promise(function (resolve) {
+    canvas.toBlob(function (b) { resolve(b); }, mime, quality);
+  });
+}
+
+function drawScaled(src, scale) {
+  const w = Math.max(1, Math.round(src.width * scale));
+  const h = Math.max(1, Math.round(src.height * scale));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const x = c.getContext('2d');
+  x.imageSmoothingEnabled = true;
+  x.imageSmoothingQuality = 'high';
+  x.drawImage(src, 0, 0, w, h);
+  return c;
+}
+
+const Q_FLOOR = 0.40, Q_CEIL = 0.95, ITER = 7;
+
+async function hit(src, mime, target) {
+  // 1) hold the pixel dimensions, push quality down until it fits
+  const full = drawScaled(src, 1);
+  let lo = Q_FLOOR, hi = Q_CEIL, best = null;
+  const top = await encode(full, mime, Q_CEIL);
+  if (top && top.size <= target) {
+    best = { blob: top, q: Q_CEIL, scale: 1 };
+  } else {
+    const floorBlob = await encode(full, mime, Q_FLOOR);
+    if (floorBlob && floorBlob.size <= target) {
+      best = { blob: floorBlob, q: Q_FLOOR, scale: 1 };
+      for (let i = 0; i < ITER; i++) {
+        const mid = (lo + hi) / 2;
+        const b = await encode(full, mime, mid);
+        if (b && b.size <= target) { best = { blob: b, q: mid, scale: 1 }; lo = mid; }
+        else { hi = mid; }
+      }
+    }
+  }
+  if (best) return best;
+
+  // 2) quality floor is not enough: give up pixels instead
+  let slo = 0.05, shi = 1, sbest = null;
+  for (let i = 0; i < ITER; i++) {
+    const mid = (slo + shi) / 2;
+    const c = drawScaled(src, mid);
+    const b = await encode(c, mime, Q_FLOOR);
+    if (b && b.size <= target) { sbest = { blob: b, q: Q_FLOOR, scale: mid }; slo = mid; }
+    else { shi = mid; }
+  }
+  if (sbest) {
+    // 3) at the largest fitting resolution, spend the leftover budget on quality
+    const c2 = drawScaled(src, sbest.scale);
+    let qlo = Q_FLOOR, qhi = Q_CEIL, best2 = sbest;
+    for (let i = 0; i < ITER; i++) {
+      const mid = (qlo + qhi) / 2;
+      const b = await encode(c2, mime, mid);
+      if (b && b.size <= target) { best2 = { blob: b, q: mid, scale: sbest.scale }; qlo = mid; }
+      else { qhi = mid; }
+    }
+    return best2;
+  }
+  return { blob: null, q: Q_FLOOR, scale: slo };
+}
+
+window.runAll = async function () {
+  const patterns = ['photo', 'screenshot', 'flat'];
+  const sizes = [[4000, 3000], [1920, 1080], [1024, 1024]];
+  const formats = [['image/jpeg', 'jpeg'], ['image/webp', 'webp']];
+  const targetsKb = [20, 50, 100, 200, 500, 1024];
+  const rows = ['pattern,src_w,src_h,format,target_kb,target_bytes,out_bytes,out_w,out_h,quality,scale,fits'];
+  const log = document.getElementById('log');
+  for (const p of patterns) {
+    for (const s of sizes) {
+      const src = makeSource(p, s[0], s[1]);
+      for (const f of formats) {
+        for (const kb of targetsKb) {
+          const target = kb * 1024;
+          const r = await hit(src, f[0], target);
+          const w = r.blob ? Math.round(s[0] * r.scale) : 0;
+          const h = r.blob ? Math.round(s[1] * r.scale) : 0;
+          rows.push([p, s[0], s[1], f[1], kb, target,
+            r.blob ? r.blob.size : 0, w, h,
+            r.q === null ? '' : r.q.toFixed(3), r.scale.toFixed(3),
+            r.blob && r.blob.size <= target ? 1 : 0].join(','));
+          log.textContent = 'progress ' + rows.length + ' ' + p + ' ' + s.join('x') + ' ' + f[1] + ' ' + kb + 'KB';
+          await new Promise(function (res) { setTimeout(res, 0); });
+        }
+      }
+    }
+  }
+  log.textContent = 'DONE\n' + rows.join('\n');
+  return rows.join('\n');
+};
+</script>
+</body></html>
